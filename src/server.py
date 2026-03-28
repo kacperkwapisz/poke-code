@@ -262,6 +262,8 @@ class RunState:
     cost_usd: float = 0.0
     budget_usd: float = 1.0
     tokens_used: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     created_at: str = field(default_factory=_now)
     started_at: str | None = None
     completed_at: str | None = None
@@ -284,6 +286,7 @@ class RunState:
         duration = (datetime.now(timezone.utc) - start).total_seconds() if start else 0
         return {
             "run_id": self.run_id,
+            "repo_url": self.repo_url,
             "status": self.status,
             "phase": self.phase,
             "engine": self.engine,
@@ -295,7 +298,12 @@ class RunState:
             "cost_usd": self.cost_usd,
             "budget_usd": self.budget_usd,
             "tokens_used": self.tokens_used,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
             "duration_seconds": round(duration, 1),
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
             "recent_activity": self.activity_log[-10:],
             "files_modified": sorted(self.files_modified),
             "summary_so_far": self.result_summary,
@@ -490,7 +498,9 @@ def _handle_claude_event(run: RunState, event: dict) -> None:
         run.cost_usd = event.get("total_cost_usd", 0.0)
         run.turns_used = event.get("num_turns", run.turns_used)
         usage = event.get("usage", {})
-        run.tokens_used = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        run.input_tokens = usage.get("input_tokens", 0)
+        run.output_tokens = usage.get("output_tokens", 0)
+        run.tokens_used = run.input_tokens + run.output_tokens
         result_text = event.get("result", "")
         if result_text:
             run.result_summary = result_text[:500]
@@ -723,7 +733,9 @@ def _handle_opencode_event(run: RunState, event: dict) -> None:
     elif event_type == "step_finish":
         tokens = event.get("tokens", {})
         if isinstance(tokens, dict):
-            run.tokens_used += tokens.get("input", 0) + tokens.get("output", 0)
+            run.input_tokens += tokens.get("input", 0)
+            run.output_tokens += tokens.get("output", 0)
+            run.tokens_used = run.input_tokens + run.output_tokens
         reason = event.get("reason", "")
         if reason == "stop":
             run.add_activity({"type": "step_finish", "detail": "Step finished (stop)"})
@@ -1262,6 +1274,8 @@ async def execute_task(
     run.turns_used = 0
     run.cost_usd = 0.0
     run.tokens_used = 0
+    run.input_tokens = 0
+    run.output_tokens = 0
     run.started_at = None
     run.completed_at = None
     run.result_summary = None
