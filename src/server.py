@@ -79,7 +79,9 @@ class DropNonMCPRoutes:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http" and not scope["path"].startswith("/mcp"):
+        if scope["type"] == "http" and not (
+            scope["path"].startswith("/mcp") or scope["path"].startswith("/auth/")
+        ):
             response = Response(status_code=404)
             await response(scope, receive, send)
             return
@@ -164,8 +166,10 @@ _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 # Flow expiry
 _DEVICE_FLOW_TTL = 900  # 15 minutes
 _REDIRECT_FLOW_TTL = 300  # 5 minutes
+_API_KEY_FLOW_TTL = 600  # 10 minutes
 
 _auth_json_lock = threading.Lock()
+_auth_flows: dict[str, dict] = {}  # module-level so HTTP routes can access
 
 
 def _read_auth_json() -> dict:
@@ -982,7 +986,6 @@ async def lifespan(server: FastMCP):
     clone_semaphore = asyncio.Semaphore(max_concurrent_clones)
 
     runs: dict[str, RunState] = {}
-    auth_flows: dict[str, dict] = {}  # pending OAuth flows keyed by flow_id
 
     async with httpx.AsyncClient() as http_client:
         logger.info("poke-code started")
@@ -992,7 +995,7 @@ async def lifespan(server: FastMCP):
                 "runs": runs,
                 "http_client": http_client,
                 "clone_semaphore": clone_semaphore,
-                "auth_flows": auth_flows,
+                "auth_flows": _auth_flows,
             }
         finally:
             for run in runs.values():
@@ -1025,6 +1028,86 @@ mcp = FastMCP("poke-code", lifespan=lifespan, auth=auth)
 async def health(request):
     from starlette.responses import JSONResponse
     return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Auth key entry routes (browser-based, no API key passes through MCP)
+# ---------------------------------------------------------------------------
+
+_AUTH_FORM_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>poke-code — {provider} auth</title>
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{font-family:system-ui,sans-serif;background:#0a0a0a;color:#e5e5e5;display:flex;justify-content:center;align-items:center;min-height:100vh}}
+  .card{{background:#171717;border:1px solid #262626;border-radius:12px;padding:2rem;max-width:420px;width:100%}}
+  h1{{font-size:1.25rem;margin-bottom:.5rem}}
+  p{{font-size:.875rem;color:#a3a3a3;margin-bottom:1.5rem}}
+  label{{font-size:.875rem;display:block;margin-bottom:.5rem}}
+  input[type=password]{{width:100%;padding:.625rem;background:#0a0a0a;border:1px solid #404040;border-radius:6px;color:#e5e5e5;font-size:.875rem;margin-bottom:1rem}}
+  input[type=password]:focus{{outline:none;border-color:#3b82f6}}
+  button{{width:100%;padding:.625rem;background:#3b82f6;color:#fff;border:none;border-radius:6px;font-size:.875rem;cursor:pointer}}
+  button:hover{{background:#2563eb}}
+  .ok{{text-align:center;color:#22c55e;font-size:1.1rem;padding:2rem 0}}
+  .err{{color:#ef4444;font-size:.875rem;margin-bottom:1rem}}
+</style></head><body>
+<div class="card">
+  {body}
+</div></body></html>"""
+
+_AUTH_FORM_BODY = """<h1>Authenticate {provider}</h1>
+<p>Enter your API key below. It will be stored on the server — the MCP client never sees it.</p>
+{error}
+<form method="POST">
+  <label for="key">API Key</label>
+  <input type="password" id="key" name="key" placeholder="sk-..." required autofocus>
+  <button type="submit">Save &amp; authenticate</button>
+</form>"""
+
+_AUTH_SUCCESS_BODY = """<div class="ok">&#10003; {provider} authenticated</div>
+<p style="text-align:center;margin-top:1rem">You can close this tab.</p>"""
+
+_AUTH_EXPIRED_BODY = """<div class="ok" style="color:#ef4444">This link has expired.</div>
+<p style="text-align:center;margin-top:1rem">Request a new one via provider_login.</p>"""
+
+
+@mcp.custom_route("/auth/{token}", methods=["GET"])
+async def auth_form_get(request):
+    from starlette.responses import HTMLResponse
+    token = request.path_params["token"]
+    _expire_auth_flows(_auth_flows)
+    flow = _auth_flows.get(token)
+    if not flow or flow.get("type") != "api_key_form":
+        return HTMLResponse(
+            _AUTH_FORM_HTML.format(provider="", body=_AUTH_EXPIRED_BODY), status_code=410
+        )
+    provider = flow["provider"]
+    body = _AUTH_FORM_BODY.format(provider=provider, error="")
+    return HTMLResponse(_AUTH_FORM_HTML.format(provider=provider, body=body))
+
+
+@mcp.custom_route("/auth/{token}", methods=["POST"])
+async def auth_form_post(request):
+    from starlette.responses import HTMLResponse
+    token = request.path_params["token"]
+    _expire_auth_flows(_auth_flows)
+    flow = _auth_flows.get(token)
+    if not flow or flow.get("type") != "api_key_form":
+        return HTMLResponse(
+            _AUTH_FORM_HTML.format(provider="", body=_AUTH_EXPIRED_BODY), status_code=410
+        )
+    form = await request.form()
+    key = (form.get("key") or "").strip()
+    provider = flow["provider"]
+    auth_key = flow["auth_key"]
+    if not key:
+        error = '<p class="err">API key cannot be empty.</p>'
+        body = _AUTH_FORM_BODY.format(provider=provider, error=error)
+        return HTMLResponse(_AUTH_FORM_HTML.format(provider=provider, body=body), status_code=400)
+    _write_auth_json({auth_key: {"type": "api", "key": key}})
+    flow["completed"] = True
+    body = _AUTH_SUCCESS_BODY.format(provider=provider)
+    return HTMLResponse(_AUTH_FORM_HTML.format(provider=provider, body=body))
 
 
 # ---------------------------------------------------------------------------
@@ -1522,14 +1605,13 @@ def _expire_auth_flows(auth_flows: dict[str, dict]) -> None:
 
 @mcp.tool(description=(
     "Authenticate an OpenCode provider. "
-    "For API key providers: pass provider + api_key. "
-    "For OAuth providers (openai, anthropic, google): pass provider only to start the flow. "
+    "For API key providers: returns a URL where the user enters their key directly (the MCP client never sees the key). "
+    "For OAuth providers (openai, anthropic, google): starts an OAuth flow. "
     "Returns a flow_id + instructions — poll with provider_login_poll."
 ))
 async def provider_login(
     ctx: Context,
     provider: str,
-    api_key: str = "",
     plan: str = "console",
 ) -> dict:
     auth_flows: dict[str, dict] = ctx.request_context.lifespan_context["auth_flows"]
@@ -1544,13 +1626,6 @@ async def provider_login(
     ptype = info["type"]
     auth_key = info.get("auth_key", provider)
 
-    # --- API key flow ---
-    if api_key and api_key.strip():
-        if ptype == "env_only":
-            return {"error": f"Provider '{provider}' only supports env var auth, not API keys."}
-        _write_auth_json({auth_key: {"type": "api", "key": api_key.strip()}})
-        return {"status": "authenticated", "provider": provider, "method": "api_key"}
-
     # --- Env-only providers ---
     if ptype == "env_only":
         env_keys = info["env"]
@@ -1560,9 +1635,23 @@ async def provider_login(
             return {"error": f"Set these env vars on the server: {', '.join(missing)}", "provider": provider}
         return {"status": "authenticated", "provider": provider, "method": "env"}
 
-    # --- API-key-only providers need a key ---
+    # --- API key providers — serve a browser form ---
     if ptype == "api":
-        return {"error": f"Provider '{provider}' requires an api_key parameter.", "provider": provider}
+        flow_id = str(uuid.uuid4())
+        auth_flows[flow_id] = {
+            "provider": provider,
+            "auth_key": auth_key,
+            "type": "api_key_form",
+            "completed": False,
+            "expires_at": time.time() + _API_KEY_FLOW_TTL,
+        }
+        return {
+            "status": "awaiting_auth",
+            "flow_id": flow_id,
+            "url": f"/auth/{flow_id}",
+            "expires_in": _API_KEY_FLOW_TTL,
+            "instructions": f"Open the URL to enter your {provider} API key. The key is submitted directly to the server — this client never sees it.",
+        }
 
     # --- OpenAI device code flow ---
     if provider == "openai":
@@ -1712,7 +1801,7 @@ async def provider_login(
     return {"error": f"Provider '{provider}' does not support interactive login."}
 
 
-@mcp.tool(description="Poll an in-progress OAuth device code flow. Call after provider_login returned status='awaiting_auth'.")
+@mcp.tool(description="Poll an in-progress auth flow. Call after provider_login returned status='awaiting_auth'.")
 async def provider_login_poll(ctx: Context, flow_id: str) -> dict:
     auth_flows: dict[str, dict] = ctx.request_context.lifespan_context["auth_flows"]
     http_client: httpx.AsyncClient = ctx.request_context.lifespan_context["http_client"]
@@ -1726,6 +1815,13 @@ async def provider_login_poll(ctx: Context, flow_id: str) -> dict:
     if flow.get("expires_at", 0) < time.time():
         del auth_flows[flow_id]
         return {"status": "expired", "flow_id": flow_id}
+
+    # --- API key form: check if user submitted via browser ---
+    if flow["type"] == "api_key_form":
+        if flow.get("completed"):
+            del auth_flows[flow_id]
+            return {"status": "authenticated", "provider": flow["provider"]}
+        return {"status": "pending", "flow_id": flow_id, "instructions": "Waiting for the user to enter their API key in the browser."}
 
     # --- Redirect flows: check if completed by callback ---
     if flow["type"] == "redirect":
