@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: poke-code
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: MCP_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false

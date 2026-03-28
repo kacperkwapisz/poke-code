@@ -1,0 +1,14 @@
+.env
+config.yml
+.git
+__pycache__
+*.pyc
+*.md
+.DS_Store
+render.yaml
+node_modules
+.claude
+.github
+.venv
+.mypy_cache
+.ruff_cache
