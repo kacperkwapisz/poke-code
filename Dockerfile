@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=3000 \
     ENVIRONMENT=production \
-    HOME=/home/appuser
+    HOME=/home/appuser \
+    PATH="/home/appuser/.opencode/bin:/home/appuser/.claude/local/bin:$PATH"
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,10 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Claude Code CLI (native binary)
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -fsSL https://claude.ai/install.sh | bash && \
+    which claude || (find / -name claude -type f 2>/dev/null | head -1 | xargs -I{} ln -sf {} /usr/local/bin/claude)
 
 # OpenCode CLI
-RUN curl -fsSL https://opencode.ai/install | bash
+RUN curl -fsSL https://opencode.ai/install | bash && \
+    which opencode || ln -sf /home/appuser/.opencode/bin/opencode /usr/local/bin/opencode
 
 # Python deps — cached unless requirements.txt changes
 WORKDIR /app
@@ -28,8 +31,8 @@ COPY config.example.yml config.example.yml
 
 # Non-root user
 RUN adduser --disabled-password --gecos "" appuser && \
-    mkdir -p /workspaces /home/appuser/.claude /home/appuser/.local/share/opencode && \
-    chown -R appuser:appuser /workspaces /home/appuser/.claude /home/appuser/.local /app
+    mkdir -p /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.local/share/opencode && \
+    chown -R appuser:appuser /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.local /app
 
 USER appuser
 
