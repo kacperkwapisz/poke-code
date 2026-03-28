@@ -29,10 +29,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY config.example.yml config.example.yml
 
-# Non-root user
+# Non-root user — own entire home dir so CLIs can create any subdirs they need
 RUN adduser --disabled-password --gecos "" appuser && \
-    mkdir -p /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.cache/opencode /home/appuser/.local/share/opencode && \
-    chown -R appuser:appuser /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.cache /home/appuser/.local /app
+    mkdir -p /workspaces && \
+    chown -R appuser:appuser /home/appuser /workspaces /app
 
 USER appuser
 
