@@ -1,6 +1,6 @@
 default_engine: claude  # "claude" or "opencode"
-webhook_url: "https://poke.com/api/v1/inbound/api-message"
-webhook_secret: ""
+webhook_url: "https://poke.com/api/v1/inbound/api-message"  # also enables Claude Code hooks for per-tool progress
+webhook_bearer_token: ""  # Bearer token for webhook auth
 webhook_progress_interval: 10
 workspace_dir: "/workspaces"
 max_concurrent_clones: 3

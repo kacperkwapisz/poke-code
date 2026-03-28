@@ -105,7 +105,7 @@ MAX_ACTIVITY_LOG_ENTRIES = 500
 MAX_COMPLETED_RUNS = 50
 
 # Secrets to strip from env passed to Claude subprocess
-_SECRET_ENV_KEYS = {"MCP_API_KEY", "WEBHOOK_SECRET"}
+_SECRET_ENV_KEYS = {"MCP_API_KEY", "WEBHOOK_BEARER_TOKEN"}
 
 _SAFE_REPO_URL = re.compile(
     r"^https?://[a-zA-Z0-9._\-]+(?::\d+)?/[a-zA-Z0-9._\-/]+(?:\.git)?$"
@@ -119,6 +119,15 @@ def _now() -> str:
 def _safe_env() -> dict[str, str]:
     """Return current env minus secrets — safe to pass to subprocesses."""
     return {k: v for k, v in os.environ.items() if k not in _SECRET_ENV_KEYS}
+
+
+def _subprocess_env(config: dict) -> dict[str, str]:
+    """Build env for subprocesses — safe env + webhook token for hooks."""
+    env = _safe_env()
+    bearer_token = config.get("webhook_bearer_token", "")
+    if bearer_token:
+        env["POKE_WEBHOOK_TOKEN"] = bearer_token
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +214,54 @@ class RunState:
 # ---------------------------------------------------------------------------
 # Plan mode
 # ---------------------------------------------------------------------------
+
+def _write_claude_hooks(repo_path: str, run_id: str, config: dict) -> None:
+    """Write .claude/settings.json with webhook hooks if webhook_url is configured."""
+    webhook_url = config.get("webhook_url")
+    if not webhook_url:
+        return
+
+    hooks_dir = os.path.join(repo_path, ".claude")
+    os.makedirs(hooks_dir, exist_ok=True)
+
+    # Shell script that POSTs hook events to the webhook.
+    # Auth token is passed via env var (POKE_WEBHOOK_TOKEN) to avoid leaking to the filesystem.
+    hook_script = os.path.join(hooks_dir, "poke-hook.sh")
+    with open(hook_script, "w") as f:
+        f.write(f"""#!/bin/sh
+EVENT_TYPE="${{1:-unknown}}"
+PAYLOAD=$(cat <<HOOKEOF
+{{"run_id":"{run_id}","type":"hook","event":"$EVENT_TYPE","tool_name":"$CLAUDE_TOOL_NAME","file_path":"$CLAUDE_FILE_PATH","ts":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}}
+HOOKEOF
+)
+AUTH_HEADER=""
+if [ -n "$POKE_WEBHOOK_TOKEN" ]; then
+  AUTH_HEADER="-H Authorization:\\ Bearer\\ $POKE_WEBHOOK_TOKEN"
+fi
+curl -sf -X POST '{webhook_url}' -H 'Content-Type: application/json' $AUTH_HEADER -d "$PAYLOAD" >/dev/null 2>&1 &
+""")
+    os.chmod(hook_script, 0o755)
+
+    # Merge with existing settings if present
+    settings_path = os.path.join(hooks_dir, "settings.json")
+    existing: dict = {}
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    poke_hooks = {
+        "EditTool": [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} edit"}]}],
+        "WriteTool": [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} write"}]}],
+        "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} stop"}]}],
+    }
+    existing.setdefault("hooks", {}).update(poke_hooks)
+
+    with open(settings_path, "w") as f:
+        json.dump(existing, f)
+
 
 _PLAN_ONLY_PREFIX = """You are in PLANNING MODE. Analyze the codebase and produce a detailed implementation plan.
 
@@ -315,7 +372,7 @@ async def run_claude_task(
     run.add_activity({"type": "start", "detail": f"Task execution started (mode={run.execution_mode})"})
 
     cmd: list[str] = [
-        "claude", "--bare", "-p", task_description,
+        "claude", "-p", task_description,
         "--output-format", "stream-json",
         "--verbose",
         "--max-turns", str(run.turns_max),
@@ -335,7 +392,7 @@ async def run_claude_task(
             cwd=run.repo_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_safe_env(),
+            env=_subprocess_env(config),
         )
         run._process = proc
 
@@ -522,7 +579,7 @@ async def run_opencode_task(
             cwd=run.repo_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_safe_env(),
+            env=_subprocess_env(config),
         )
         run._process = proc
 
@@ -614,16 +671,11 @@ async def run_opencode_task(
 # ---------------------------------------------------------------------------
 
 
-def _build_webhook_headers(config: dict, payload_bytes: bytes) -> dict[str, str]:
+def _build_webhook_headers(config: dict) -> dict[str, str]:
     headers: dict[str, str] = {}
-    webhook_secret = config.get("webhook_secret")
-    if webhook_secret:
-        sig = hmac.new(
-            webhook_secret.encode(),
-            payload_bytes,
-            "sha256",
-        ).hexdigest()
-        headers["X-Webhook-Signature"] = sig
+    bearer_token = config.get("webhook_bearer_token")
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
     return headers
 
 
@@ -651,7 +703,7 @@ async def _fire_webhook(
     }
 
     payload_bytes = json.dumps(payload, sort_keys=True).encode()
-    headers = _build_webhook_headers(config, payload_bytes)
+    headers = _build_webhook_headers(config)
 
     try:
         resp = await http_client.post(webhook_url, content=payload_bytes, headers={
@@ -686,7 +738,7 @@ async def _fire_progress_webhook(
     }
 
     payload_bytes = json.dumps(payload, sort_keys=True).encode()
-    headers = _build_webhook_headers(config, payload_bytes)
+    headers = _build_webhook_headers(config)
 
     try:
         await http_client.post(webhook_url, content=payload_bytes, headers={
@@ -865,6 +917,10 @@ async def execute_task(
         with open(claude_md_path, "w") as f:
             f.write(claude_md)
 
+    # Write Claude Code hooks for webhook progress (optional, claude engine only)
+    if resolved_engine == "claude":
+        _write_claude_hooks(run.repo_path, run_id, config)
+
     # Preserve plan_text for implement mode before reset
     saved_plan = run.plan_text if mode == "implement" else None
 
@@ -893,7 +949,10 @@ async def execute_task(
     elif mode == "plan":
         run.plan_text = None
         run.plan_status = None
-    # mode="full" leaves plan fields as-is (cleared by reset above implicitly — they weren't touched)
+    else:
+        # mode="full" — clear stale plan fields
+        run.plan_text = None
+        run.plan_status = None
 
     # Wrap task with approved plan context for implement mode
     if mode == "implement" and saved_plan:
@@ -1145,6 +1204,40 @@ async def approve_plan(
         else:
             run.add_activity({"type": "plan", "detail": "Plan rejected"})
         return {"run_id": run_id, "status": "rejected"}
+
+
+@mcp.tool(description="Check if Claude Code authentication is configured. Call this before execute_task with the claude engine to verify auth. Returns setup instructions if not configured.")
+async def setup_auth(ctx: Context, engine: str = "claude") -> dict:
+    if engine == "claude":
+        has_oauth_token = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+        has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        has_credentials_file = os.path.isfile(os.path.expanduser("~/.claude/.credentials.json"))
+
+        if has_oauth_token or has_api_key or has_credentials_file:
+            method = "oauth_token" if has_oauth_token else "api_key" if has_api_key else "credentials_file"
+            return {"authenticated": True, "engine": "claude", "method": method}
+
+        return {
+            "authenticated": False,
+            "engine": "claude",
+            "instructions": (
+                "Claude Code is not authenticated. "
+                "Tell the user to do ONE of the following:\n\n"
+                "Option 1 (recommended — uses existing Claude subscription):\n"
+                "  1. Run `claude setup-token` on a machine with a browser\n"
+                "  2. Set the output as CLAUDE_CODE_OAUTH_TOKEN env var on this server\n\n"
+                "Option 2 (API key — pay-per-use):\n"
+                "  1. Get an API key from console.anthropic.com\n"
+                "  2. Set it as ANTHROPIC_API_KEY env var on this server"
+            ),
+        }
+
+    elif engine == "opencode":
+        if shutil.which("opencode"):
+            return {"authenticated": True, "engine": "opencode", "method": "cli"}
+        return {"authenticated": False, "engine": "opencode", "instructions": "opencode CLI is not installed."}
+
+    return {"error": f"Unknown engine '{engine}'"}
 
 
 @mcp.tool(description="Get server info including active run count and system stats.")
