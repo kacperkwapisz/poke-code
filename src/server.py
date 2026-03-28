@@ -249,6 +249,7 @@ class RunState:
     status: str = "ready"  # ready, running, completed, failed, cancelled
     phase: str = "idle"  # cloning, idle, thinking, using_tool, editing_files, complete
     engine: str = "claude"  # "claude" or "opencode"
+    model: str = ""
     task: asyncio.Task | None = field(default=None, repr=False)
     _cancel_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _process: asyncio.subprocess.Process | None = field(default=None, repr=False)
@@ -286,6 +287,7 @@ class RunState:
             "status": self.status,
             "phase": self.phase,
             "engine": self.engine,
+            "model": self.model or None,
             "current_tool": self.current_tool,
             "current_file": self.current_file,
             "turns_used": self.turns_used,
@@ -308,6 +310,7 @@ class RunState:
             "repo_url": self.repo_url,
             "status": self.status,
             "engine": self.engine,
+            "model": self.model or None,
             "turns_used": self.turns_used,
             "cost_usd": self.cost_usd,
             "tokens_used": self.tokens_used,
@@ -439,6 +442,8 @@ def _handle_claude_event(run: RunState, event: dict) -> None:
         run.turns_used += 1
         run.phase = "thinking"
         message = event.get("message", {})
+        if not run.model and message.get("model"):
+            run.model = message["model"]
         for block in message.get("content", []):
             block_type = block.get("type", "")
             if block_type == "text":
@@ -480,6 +485,8 @@ def _handle_claude_event(run: RunState, event: dict) -> None:
             run.phase = "thinking"
 
     elif event_type == "result":
+        if event.get("model"):
+            run.model = event["model"]
         run.cost_usd = event.get("total_cost_usd", 0.0)
         run.turns_used = event.get("num_turns", run.turns_used)
         usage = event.get("usage", {})
@@ -506,6 +513,7 @@ async def run_claude_task(
     config: dict,
     http_client: httpx.AsyncClient,
     system_prompt: str | None = None,
+    model_override: str | None = None,
 ) -> None:
     claude_config = config.get("claude", {})
     allowed_tools = claude_config.get("allowed_tools", [
@@ -533,6 +541,8 @@ async def run_claude_task(
         "--verbose",
         "--max-turns", str(run.turns_max),
     ]
+    if model_override:
+        cmd.extend(["--model", model_override])
     if run.budget_usd:
         cmd.extend(["--max-budget-usd", str(run.budget_usd)])
     if allowed_tools:
@@ -664,6 +674,8 @@ def _handle_opencode_event(run: RunState, event: dict) -> None:
     if event_type == "step_start":
         run.phase = "thinking"
         run.turns_used += 1
+        if event.get("model"):
+            run.model = event["model"]
         run.add_activity({"type": "step_start", "detail": "New reasoning step"})
 
     elif event_type == "text":
@@ -723,15 +735,17 @@ async def run_opencode_task(
     config: dict,
     http_client: httpx.AsyncClient,
     system_prompt: str | None = None,
+    model_override: str | None = None,
 ) -> None:
     opencode_config = config.get("opencode", {})
-    model = opencode_config.get("model", "")
+    model = model_override or opencode_config.get("model", "")
     progress_interval = config.get("webhook_progress_interval", 10)
 
+    run.model = model or "opencode/default"
     run.status = "running"
     run.phase = "thinking"
     run.started_at = _now()
-    run.add_activity({"type": "start", "detail": "Task execution started (opencode)"})
+    run.add_activity({"type": "start", "detail": f"Task execution started (opencode, model={run.model})"})
 
     # Plan mode: prepend planning constraint to the prompt
     if run.execution_mode == "plan":
@@ -1178,6 +1192,7 @@ async def execute_task(
     system_prompt: str = "",
     claude_md: str = "",
     engine: str = "",
+    model: str = "",
     mode: str = "full",
 ) -> dict:
     runs: dict[str, RunState] = ctx.request_context.lifespan_context["runs"]
@@ -1238,6 +1253,7 @@ async def execute_task(
     run.status = "running"
     run.phase = "thinking"
     run.engine = resolved_engine
+    run.model = model or ""
     run.execution_mode = mode
     run.activity_log.clear()
     run.files_modified.clear()
@@ -1273,6 +1289,7 @@ async def execute_task(
             run_opencode_task(
                 run, task_description, config, http_client,
                 system_prompt=system_prompt or None,
+                model_override=model or None,
             )
         )
     else:
@@ -1280,10 +1297,11 @@ async def execute_task(
             run_claude_task(
                 run, task_description, config, http_client,
                 system_prompt=system_prompt or None,
+                model_override=model or None,
             )
         )
 
-    return {"run_id": run_id, "status": "running", "engine": resolved_engine}
+    return {"run_id": run_id, "status": "running", "engine": resolved_engine, "model": model or None}
 
 
 @mcp.tool(description="Get detailed status of a run including current tool, files modified, cost, and recent activity.")
