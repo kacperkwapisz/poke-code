@@ -1,66 +1,109 @@
-# MCP Server Template
+# poke-code
 
-A minimal [FastMCP](https://github.com/jlowin/fastmcp) server template for Render deployment with streamable HTTP transport.
+MCP server that runs autonomous coding agents in sandboxed workspaces. Clone a repo, execute tasks with Claude Agent SDK or OpenCode CLI, review diffs, commit and push — all over MCP.
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/InteractionCo/mcp-server-template)
+## Features
 
-## Local Development
+- **Two engines** — Claude Agent SDK and OpenCode CLI
+- **Plan-first workflow** — `plan` → `approve` → `implement` for controlled execution
+- **Full mode** — skip planning for quick fixes
+- **Sandboxed workspaces** — each run gets its own cloned repo
+- **Webhook notifications** — progress and completion callbacks
+- **Auth** — API key verification via Bearer token
 
-### Setup
-
-Fork the repo, then run:
+## Quick Start
 
 ```bash
-git clone <your-repo-url>
-cd mcp-server-template
-conda create -n mcp-server python=3.13
-conda activate mcp-server
+# Clone
+git clone https://github.com/kacperkwapisz/poke-code.git
+cd poke-code
+
+# Configure
+cp .env.example .env
+cp config.example.yml config.yml
+# Edit .env with your ANTHROPIC_API_KEY and MCP_API_KEY
+
+# Run
 pip install -r requirements.txt
+python src/server.py
 ```
 
-### Test
+Server starts on `http://localhost:3000/mcp` (streamable HTTP transport).
+
+## Docker
 
 ```bash
-python src/server.py
-# then in another terminal run:
-npx @modelcontextprotocol/inspector
+docker build -t poke-code .
+docker run -p 3000:3000 \
+  -e ANTHROPIC_API_KEY=sk-... \
+  -e MCP_API_KEY=your-secret \
+  -e ENVIRONMENT=production \
+  poke-code
 ```
 
-Open http://localhost:3000 and connect to `http://localhost:8000/mcp` using "Streamable HTTP" transport (NOTE THE `/mcp`!).
+Or pull from GHCR:
 
-## Deployment
+```bash
+# Latest (staging, built from main)
+docker pull ghcr.io/kacperkwapisz/poke-code:latest
 
-### Option 1: One-Click Deploy
-Click the "Deploy to Render" button above.
-
-### Option 2: Manual Deployment
-1. Fork this repository
-2. Connect your GitHub account to Render
-3. Create a new Web Service on Render
-4. Connect your forked repository
-5. Render will automatically detect the `render.yaml` configuration
-
-Your server will be available at `https://your-service-name.onrender.com/mcp` (NOTE THE `/mcp`!)
-
-## Poke Setup
-
-You can connect your MCP server to Poke at (poke.com/settings/connections)[poke.com/settings/connections].
-To test the connection explitly, ask poke somethink like `Tell the subagent to use the "{connection name}" integration's "{tool name}" tool`.
-If you run into persistent issues of poke not calling the right MCP (e.g. after you've renamed the connection) you may send `clearhistory` to poke to delete all message history and start fresh.
-We're working hard on improving the integration use of Poke :)
-
-
-## Customization
-
-Add more tools by decorating functions with `@mcp.tool`:
-
-```python
-@mcp.tool
-def calculate(x: float, y: float, operation: str) -> float:
-    """Perform basic arithmetic operations."""
-    if operation == "add":
-        return x + y
-    elif operation == "multiply":
-        return x * y
-    # ...
+# Release
+docker pull ghcr.io/kacperkwapisz/poke-code:1.0.0
 ```
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `clone_and_init` | Clone a repo and create a workspace |
+| `execute_task` | Run a coding task (`mode`: `plan`, `implement`, or `full`) |
+| `approve_plan` | Approve or reject a plan before implementation |
+| `get_status` | Poll run progress, phase, cost, and plan status |
+| `get_output` | Paginated activity log |
+| `get_diff` | Git diff of workspace changes |
+| `commit_and_push` | Commit and push changes |
+| `cancel_task` | Cancel a running task |
+| `cleanup_run` | Delete workspace and run state |
+| `list_runs` | List all runs |
+| `get_server_info` | Server health and capabilities |
+
+## Workflow
+
+### Plan-first (recommended)
+
+```
+clone_and_init(repo_url)           → run_id
+execute_task(run_id, task, mode="plan")  → agent explores, produces plan
+get_status(run_id)                 → poll until completed, read plan_text
+approve_plan(run_id, approve=True) → approved
+execute_task(run_id, task, mode="implement") → agent implements the plan
+get_diff(run_id)                   → review changes
+commit_and_push(run_id, message, branch)
+```
+
+### Quick fix
+
+```
+clone_and_init(repo_url)           → run_id
+execute_task(run_id, task)         → mode="full" by default
+get_diff(run_id)
+commit_and_push(run_id, message, branch)
+```
+
+## Configuration
+
+See [`config.example.yml`](config.example.yml) for all options including engine settings, concurrency limits, and webhook configuration.
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | API key for Claude Agent SDK |
+| `MCP_API_KEY` | Production | Bearer token for MCP auth |
+| `ENVIRONMENT` | No | Set to `production` to require `MCP_API_KEY` |
+| `CONFIG_PATH` | No | Path to config file (default: `config.yml`) |
+| `PORT` | No | Server port (default: `3000`) |
+
+## License
+
+MIT
