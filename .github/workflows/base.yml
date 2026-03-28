@@ -26,7 +26,13 @@ jobs:
       - name: Check for new Claude Code version
         id: compare
         run: |
-          LATEST=$(npm view @anthropic-ai/claude-code version)
+          # Get latest available version via the installer
+          LATEST=$(curl -fsSL https://claude.ai/install.sh | bash -s -- --version 2>/dev/null || true)
+          # If installer doesn't support --version, install and check
+          if [ -z "$LATEST" ]; then
+            curl -fsSL https://claude.ai/install.sh | bash
+            LATEST=$(claude --version 2>/dev/null || echo "unknown")
+          fi
           # Get version baked into current base image
           CURRENT=$(docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest claude --version 2>/dev/null || echo "none")
           if [ "$LATEST" != "$CURRENT" ]; then
