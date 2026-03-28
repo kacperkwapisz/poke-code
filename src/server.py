@@ -10,20 +10,11 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+
 
 import httpx
 import uvicorn
 import yaml
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    TextBlock,
-    ToolUseBlock,
-    query,
-)
-from claude_agent_sdk.types import StreamEvent
 from fastmcp import Context, FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from starlette.middleware import Middleware
@@ -114,7 +105,7 @@ MAX_ACTIVITY_LOG_ENTRIES = 500
 MAX_COMPLETED_RUNS = 50
 
 # Secrets to strip from env passed to Claude subprocess
-_SECRET_ENV_KEYS = {"MCP_API_KEY", "ANTHROPIC_API_KEY", "WEBHOOK_SECRET"}
+_SECRET_ENV_KEYS = {"MCP_API_KEY", "WEBHOOK_SECRET"}
 
 _SAFE_REPO_URL = re.compile(
     r"^https?://[a-zA-Z0-9._\-]+(?::\d+)?/[a-zA-Z0-9._\-/]+(?:\.git)?$"
@@ -224,8 +215,76 @@ RULES:
 
 
 # ---------------------------------------------------------------------------
-# Claude Agent SDK runner
+# Claude Code CLI runner
 # ---------------------------------------------------------------------------
+
+
+def _handle_claude_event(run: RunState, event: dict) -> None:
+    event_type = event.get("type", "")
+
+    if event_type == "assistant":
+        run.turns_used += 1
+        run.phase = "thinking"
+        message = event.get("message", {})
+        for block in message.get("content", []):
+            block_type = block.get("type", "")
+            if block_type == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    run.result_summary = text[:200]
+                    run.add_activity({"type": "text", "detail": text[:300]})
+                    if run.execution_mode == "plan":
+                        run.plan_text = (run.plan_text or "") + text + "\n"
+            elif block_type == "tool_use":
+                tool_name = block.get("name", "unknown")
+                run.current_tool = tool_name
+                run.phase = "using_tool"
+                tool_input = block.get("input", {})
+                if isinstance(tool_input, dict):
+                    file_path = tool_input.get("file_path") or tool_input.get("file") or tool_input.get("path")
+                else:
+                    file_path = None
+                if file_path and tool_name in ("Edit", "Write"):
+                    run.files_modified.add(file_path)
+                    run.current_file = file_path
+                    run.phase = "editing_files"
+                run.add_activity({
+                    "type": "tool_start",
+                    "tool": tool_name,
+                    "input": {k: v for k, v in tool_input.items() if k != "content"} if isinstance(tool_input, dict) else {},
+                })
+
+    elif event_type == "user":
+        # Tool results coming back — mark tool as finished
+        if run.current_tool:
+            run.add_activity({
+                "type": "tool_end",
+                "tool": run.current_tool,
+                "detail": f"Finished {run.current_tool}",
+            })
+            run.current_tool = None
+            run.current_file = None
+            run.phase = "thinking"
+
+    elif event_type == "result":
+        run.cost_usd = event.get("total_cost_usd", 0.0)
+        run.turns_used = event.get("num_turns", run.turns_used)
+        usage = event.get("usage", {})
+        run.tokens_used = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        result_text = event.get("result", "")
+        if result_text:
+            run.result_summary = result_text[:500]
+        if run.execution_mode == "plan" and result_text and not event.get("is_error"):
+            run.plan_text = result_text
+            run.plan_status = "pending_review"
+        if event.get("is_error"):
+            run.status = "failed"
+            run.add_activity({"type": "result", "subtype": "error", "detail": result_text or "Unknown error"})
+        else:
+            run.status = "completed"
+            run.add_activity({"type": "result", "subtype": "success", "detail": result_text or "Task completed"})
+        run.phase = "complete"
+        run.completed_at = _now()
 
 
 async def run_claude_task(
@@ -255,30 +314,65 @@ async def run_claude_task(
     run.started_at = _now()
     run.add_activity({"type": "start", "detail": f"Task execution started (mode={run.execution_mode})"})
 
-    options = ClaudeAgentOptions(
-        allowed_tools=allowed_tools,
-        disallowed_tools=disallowed_tools if disallowed_tools else None,
-        permission_mode="acceptEdits",
-        cwd=run.repo_path,
-        env={"IS_SANDBOX": "1"},
-        max_turns=run.turns_max,
-    )
+    cmd: list[str] = [
+        "claude", "--bare", "-p", task_description,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--max-turns", str(run.turns_max),
+    ]
+    if run.budget_usd:
+        cmd.extend(["--max-budget-usd", str(run.budget_usd)])
+    if allowed_tools:
+        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    if disallowed_tools:
+        cmd.extend(["--disallowedTools", ",".join(disallowed_tools)])
     if system_prompt:
-        options.system_prompt = system_prompt
+        cmd.extend(["--append-system-prompt", system_prompt])
 
     try:
-        async for message in query(prompt=task_description, options=options):
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=run.repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_safe_env(),
+        )
+        run._process = proc
+
+        assert proc.stdout is not None
+        last_webhook_turn = 0
+        while True:
             if run._cancel_event.is_set():
+                if proc.returncode is None:
+                    proc.terminate()
+                    await proc.wait()
                 break
-            if isinstance(message, StreamEvent):
-                _handle_stream_event(run, message)
-            elif isinstance(message, AssistantMessage):
-                _handle_assistant_message(run, message)
-                # Fire progress webhook every N turns
-                if progress_interval and run.turns_used % progress_interval == 0:
-                    await _fire_progress_webhook(run, config, http_client)
-            elif isinstance(message, ResultMessage):
-                _handle_result_message(run, message)
+
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if not line:
+                break
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            _handle_claude_event(run, event)
+
+            if (
+                progress_interval
+                and run.turns_used > 0
+                and run.turns_used % progress_interval == 0
+                and run.turns_used != last_webhook_turn
+            ):
+                last_webhook_turn = run.turns_used
+                await _fire_progress_webhook(run, config, http_client)
+
+        if proc.returncode is None:
+            await proc.wait()
 
         if run._cancel_event.is_set():
             run.status = "cancelled"
@@ -286,12 +380,28 @@ async def run_claude_task(
             run.completed_at = _now()
             run.add_activity({"type": "result", "subtype": "cancelled", "detail": "Task cancelled"})
         elif run.status == "running":
-            run.status = "completed"
-            run.phase = "complete"
-            run.completed_at = _now()
-            run.add_activity({"type": "result", "subtype": "success", "detail": "Task completed"})
+            # No result event received — check exit code
+            if proc.returncode == 0:
+                run.status = "completed"
+                run.phase = "complete"
+                run.completed_at = _now()
+                run.add_activity({"type": "result", "subtype": "success", "detail": "Task completed"})
+                if run.execution_mode == "plan" and not run.plan_text:
+                    run.plan_text = run.result_summary or ""
+                    run.plan_status = "pending_review"
+            else:
+                stderr_out = await proc.stderr.read() if proc.stderr else b""
+                error_detail = stderr_out.decode().strip() or f"claude exited with code {proc.returncode}"
+                run.status = "failed"
+                run.phase = "complete"
+                run.completed_at = _now()
+                run.result_summary = error_detail[:500]
+                run.add_activity({"type": "result", "subtype": "error", "detail": error_detail[:300]})
 
     except asyncio.CancelledError:
+        if run._process and run._process.returncode is None:
+            run._process.terminate()
+            await run._process.wait()
         run.status = "cancelled"
         run.phase = "complete"
         run.completed_at = _now()
@@ -304,91 +414,12 @@ async def run_claude_task(
         run.add_activity({"type": "result", "subtype": "error", "detail": str(e)})
         logger.exception("Task %s failed", run.run_id)
     finally:
+        run._process = None
         run.task = None
         try:
             await _fire_webhook(run, config, http_client)
         except Exception:
             logger.exception("Webhook fire failed for run %s during cleanup", run.run_id)
-
-
-def _handle_stream_event(run: RunState, message: StreamEvent) -> None:
-    event = message.event
-    event_type = event.get("type")
-
-    if event_type == "content_block_start":
-        content_block = event.get("content_block", {})
-        if content_block.get("type") == "tool_use":
-            tool_name = content_block.get("name", "unknown")
-            run.current_tool = tool_name
-            run.phase = "using_tool"
-            tool_input = content_block.get("input", {})
-            file_path = tool_input.get("file_path") or tool_input.get("file") or tool_input.get("path")
-            if file_path and tool_name in ("Edit", "Write"):
-                run.files_modified.add(file_path)
-                run.current_file = file_path
-                run.phase = "editing_files"
-            run.add_activity({
-                "type": "tool_start",
-                "tool": tool_name,
-                "input": {k: v for k, v in tool_input.items() if k != "content"} if tool_input else {},
-            })
-
-    elif event_type == "content_block_stop":
-        if run.current_tool:
-            run.add_activity({
-                "type": "tool_end",
-                "tool": run.current_tool,
-                "detail": f"Finished {run.current_tool}",
-            })
-            run.current_tool = None
-            run.current_file = None
-            run.phase = "thinking"
-
-
-def _handle_assistant_message(run: RunState, message: AssistantMessage) -> None:
-    run.turns_used += 1
-    for block in message.content:
-        if isinstance(block, TextBlock):
-            text = block.text.strip()
-            if text:
-                run.result_summary = text[:200]
-                run.add_activity({"type": "text", "detail": text[:300]})
-        elif isinstance(block, ToolUseBlock):
-            tool_name = block.name
-            run.current_tool = tool_name
-            run.phase = "using_tool"
-            tool_input = block.input if hasattr(block, "input") else {}
-            file_path = None
-            if isinstance(tool_input, dict):
-                file_path = tool_input.get("file_path") or tool_input.get("file") or tool_input.get("path")
-            if file_path and tool_name in ("Edit", "Write"):
-                run.files_modified.add(file_path)
-                run.current_file = file_path
-                run.phase = "editing_files"
-            run.add_activity({
-                "type": "tool_start",
-                "tool": tool_name,
-                "input": {k: v for k, v in tool_input.items() if k != "content"} if isinstance(tool_input, dict) else {},
-            })
-
-
-def _handle_result_message(run: RunState, message: ResultMessage) -> None:
-    run.cost_usd = message.total_cost_usd or 0.0
-    run.turns_used = message.num_turns
-    if message.result:
-        run.result_summary = message.result[:500]
-    # Capture full plan text when in planning mode
-    if run.execution_mode == "plan" and message.result and not message.is_error:
-        run.plan_text = message.result
-        run.plan_status = "pending_review"
-    if message.is_error:
-        run.status = "failed"
-        run.add_activity({"type": "result", "subtype": "error", "detail": message.result or "Unknown error"})
-    else:
-        run.status = "completed"
-        run.add_activity({"type": "result", "subtype": "success", "detail": message.result or "Task completed"})
-    run.phase = "complete"
-    run.completed_at = _now()
 
 
 # ---------------------------------------------------------------------------
@@ -818,8 +849,8 @@ async def execute_task(
     if resolved_engine not in ("claude", "opencode"):
         return {"error": f"Invalid engine '{resolved_engine}'. Must be 'claude' or 'opencode'.", "status": "failed"}
 
-    if resolved_engine == "opencode" and not shutil.which("opencode"):
-        return {"error": "opencode CLI is not installed or not on PATH", "status": "failed"}
+    if not shutil.which(resolved_engine if resolved_engine == "opencode" else "claude"):
+        return {"error": f"{resolved_engine} CLI is not installed or not on PATH", "status": "failed"}
 
     # Per-engine concurrency check
     engine_config_key = resolved_engine
@@ -1127,7 +1158,7 @@ async def get_server_info(ctx: Context) -> dict:
         "environment": os.environ.get("ENVIRONMENT", "development"),
         "default_engine": config.get("default_engine", "claude"),
         "engines": {
-            "claude": True,
+            "claude": shutil.which("claude") is not None,
             "opencode": shutil.which("opencode") is not None,
         },
         "active_runs": active,

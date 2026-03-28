@@ -35,7 +35,6 @@ Server starts on `http://localhost:3000/mcp` (streamable HTTP transport).
 ```bash
 docker build -t poke-code .
 docker run -p 3000:3000 \
-  -e ANTHROPIC_API_KEY=sk-... \
   -e MCP_API_KEY=your-secret \
   -e ENVIRONMENT=production \
   poke-code
@@ -98,11 +97,12 @@ See [`config.example.yml`](config.example.yml) for all options including engine 
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | API key for Claude Agent SDK |
 | `MCP_API_KEY` | Production | Bearer token for MCP auth |
 | `ENVIRONMENT` | No | Set to `production` to require `MCP_API_KEY` |
 | `CONFIG_PATH` | No | Path to config file (default: `config.yml`) |
 | `PORT` | No | Server port (default: `3000`) |
+
+Claude Code CLI authenticates via the user's existing subscription. No API key needed.
 
 ## License
 
