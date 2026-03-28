@@ -31,8 +31,8 @@ COPY config.example.yml config.example.yml
 
 # Non-root user
 RUN adduser --disabled-password --gecos "" appuser && \
-    mkdir -p /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.local/share/opencode && \
-    chown -R appuser:appuser /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.local /app
+    mkdir -p /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.cache/opencode /home/appuser/.local/share/opencode && \
+    chown -R appuser:appuser /workspaces /home/appuser/.claude /home/appuser/.opencode /home/appuser/.cache /home/appuser/.local /app
 
 USER appuser
 
