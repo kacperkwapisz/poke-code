@@ -3,6 +3,7 @@ FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=3000 \
+    ENVIRONMENT=production \
     HOME=/home/appuser
 
 # System deps
@@ -12,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Claude Code CLI (native binary)
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# OpenCode CLI
+RUN curl -fsSL https://opencode.ai/install | bash
 
 # Python deps — cached unless requirements.txt changes
 WORKDIR /app
@@ -24,8 +28,8 @@ COPY config.example.yml config.example.yml
 
 # Non-root user
 RUN adduser --disabled-password --gecos "" appuser && \
-    mkdir -p /workspaces /home/appuser/.claude && \
-    chown -R appuser:appuser /workspaces /home/appuser/.claude /app
+    mkdir -p /workspaces /home/appuser/.claude /home/appuser/.local/share/opencode && \
+    chown -R appuser:appuser /workspaces /home/appuser/.claude /home/appuser/.local /app
 
 USER appuser
 

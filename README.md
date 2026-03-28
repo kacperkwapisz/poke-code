@@ -4,11 +4,13 @@ MCP server that runs autonomous coding agents in sandboxed workspaces. Clone a r
 
 ## Features
 
-- **Two engines** — Claude Agent SDK and OpenCode CLI
+- **Two engines** — Claude Code CLI and OpenCode CLI
 - **Plan-first workflow** — `plan` → `approve` → `implement` for controlled execution
 - **Full mode** — skip planning for quick fixes
 - **Sandboxed workspaces** — each run gets its own cloned repo
-- **Webhook notifications** — progress and completion callbacks
+- **Webhook notifications** — progress, completion, and per-tool event callbacks
+- **Enhanced hooks** — Claude Code hooks for Read, Glob, Grep, Bash, WebSearch, Task, Edit, Write, Stop
+- **Context7 MCP** — automatic library/API docs lookup when `CONTEXT7_API_KEY` is set
 - **Auth** — API key verification via Bearer token
 
 ## Quick Start
@@ -101,6 +103,7 @@ See [`config.example.yml`](config.example.yml) for all options including engine 
 | `ENVIRONMENT` | No | Set to `production` to require `MCP_API_KEY` |
 | `CONFIG_PATH` | No | Path to config file (default: `config.yml`) |
 | `PORT` | No | Server port (default: `3000`) |
+| `CONTEXT7_API_KEY` | No | Enables Context7 MCP for automatic docs lookup |
 
 Claude Code CLI authenticates via the user's existing subscription. No API key needed.
 

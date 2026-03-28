@@ -2,11 +2,13 @@ default_engine: claude  # "claude" or "opencode"
 webhook_url: "https://poke.com/api/v1/inbound/api-message"  # also enables Claude Code hooks for per-tool progress
 webhook_bearer_token: ""  # Bearer token for webhook auth
 webhook_progress_interval: 10
+context7_api_key: ""  # Context7 MCP for auto-docs lookup; or set CONTEXT7_API_KEY env var
 workspace_dir: "/workspaces"
 max_concurrent_clones: 3
 opencode:
   model: ""  # e.g. "anthropic/claude-sonnet-4-5", empty = opencode default
   max_concurrent_tasks: 3
+  provider_env: {}  # extra env vars forwarded to opencode subprocess, e.g. {"OPENAI_API_KEY": "sk-..."}
 claude:
   max_concurrent_tasks: 3
   default_max_turns: 50

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
 import shutil
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -105,11 +109,103 @@ MAX_ACTIVITY_LOG_ENTRIES = 500
 MAX_COMPLETED_RUNS = 50
 
 # Secrets to strip from env passed to Claude subprocess
-_SECRET_ENV_KEYS = {"MCP_API_KEY", "WEBHOOK_BEARER_TOKEN"}
+_SECRET_ENV_KEYS = {"MCP_API_KEY", "WEBHOOK_BEARER_TOKEN", "CONTEXT7_API_KEY"}
 
 _SAFE_REPO_URL = re.compile(
     r"^https?://[a-zA-Z0-9._\-]+(?::\d+)?/[a-zA-Z0-9._\-/]+(?:\.git)?$"
 )
+
+_CONTEXT7_PROMPT = (
+    "Always use Context7 MCP tools (resolve-library-id, query-docs) when you need "
+    "library/API documentation, code generation examples, setup or configuration steps. "
+    "Do this automatically without the user having to explicitly ask."
+)
+
+# ---------------------------------------------------------------------------
+# OpenCode provider auth
+# ---------------------------------------------------------------------------
+
+_OPENCODE_AUTH_FILE = os.path.expanduser("~/.local/share/opencode/auth.json")
+
+_OPENCODE_PROVIDERS = {
+    "openai": {"env": "OPENAI_API_KEY", "auth_key": "openai", "type": "oauth_device"},
+    "anthropic": {"env": "ANTHROPIC_API_KEY", "auth_key": "anthropic", "type": "oauth_redirect"},
+    "google": {"env": "GEMINI_API_KEY", "auth_key": "google", "type": "oauth_redirect"},
+    "github-copilot": {"env": "GITHUB_TOKEN", "auth_key": "github-copilot", "type": "oauth_device"},
+    "deepseek": {"env": "DEEPSEEK_API_KEY", "auth_key": "deepseek", "type": "api"},
+    "groq": {"env": "GROQ_API_KEY", "auth_key": "groq", "type": "api"},
+    "openrouter": {"env": "OPENROUTER_API_KEY", "auth_key": "openrouter", "type": "api"},
+    "together": {"env": "TOGETHER_API_KEY", "auth_key": "together", "type": "api"},
+    "xai": {"env": "XAI_API_KEY", "auth_key": "xai", "type": "api"},
+    "fireworks": {"env": "FIREWORKS_API_KEY", "auth_key": "fireworks", "type": "api"},
+    "aws-bedrock": {"env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "type": "env_only"},
+    "azure-openai": {"env": ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY"], "type": "env_only"},
+    "google-vertex": {"env": ["GOOGLE_CLOUD_PROJECT"], "type": "env_only"},
+}
+
+# OAuth constants (public client IDs from community auth plugins)
+_OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_OPENAI_DEVICE_AUTH_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+_OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
+
+_ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_ANTHROPIC_AUTHORIZE_URLS = {
+    "max": "https://claude.ai/oauth/authorize",
+    "console": "https://platform.claude.com/oauth/authorize",
+}
+_ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+
+_GOOGLE_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+_GOOGLE_CLIENT_SECRET = "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"
+_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+# Flow expiry
+_DEVICE_FLOW_TTL = 900  # 15 minutes
+_REDIRECT_FLOW_TTL = 300  # 5 minutes
+
+_auth_json_lock = threading.Lock()
+
+
+def _read_auth_json() -> dict:
+    """Read OpenCode's auth.json credentials file."""
+    try:
+        with open(_OPENCODE_AUTH_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_auth_json(data: dict) -> None:
+    """Write to OpenCode's auth.json, merging with existing data."""
+    with _auth_json_lock:
+        os.makedirs(os.path.dirname(_OPENCODE_AUTH_FILE), exist_ok=True)
+        existing = _read_auth_json()
+        existing.update(data)
+        with open(_OPENCODE_AUTH_FILE, "w") as f:
+            json.dump(existing, f, indent=2)
+
+
+def _remove_auth_json_key(key: str) -> bool:
+    """Remove a provider key from auth.json. Returns True if key existed."""
+    with _auth_json_lock:
+        data = _read_auth_json()
+        if key not in data:
+            return False
+        del data[key]
+        os.makedirs(os.path.dirname(_OPENCODE_AUTH_FILE), exist_ok=True)
+        with open(_OPENCODE_AUTH_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+
+
+def _generate_pkce() -> tuple[str, str]:
+    """Generate PKCE code_verifier and code_challenge (S256)."""
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return verifier, challenge
 
 
 def _now() -> str:
@@ -122,11 +218,16 @@ def _safe_env() -> dict[str, str]:
 
 
 def _subprocess_env(config: dict) -> dict[str, str]:
-    """Build env for subprocesses — safe env + webhook token for hooks."""
+    """Build env for subprocesses — safe env + webhook token + provider env."""
     env = _safe_env()
     bearer_token = config.get("webhook_bearer_token", "")
     if bearer_token:
         env["POKE_WEBHOOK_TOKEN"] = bearer_token
+    # Forward explicit provider env vars from config
+    provider_env = config.get("opencode", {}).get("provider_env", {})
+    for key, value in provider_env.items():
+        if isinstance(key, str) and isinstance(value, str) and value:
+            env[key] = value
     return env
 
 
@@ -215,8 +316,8 @@ class RunState:
 # Plan mode
 # ---------------------------------------------------------------------------
 
-def _write_claude_hooks(repo_path: str, run_id: str, config: dict) -> None:
-    """Write .claude/settings.json with webhook hooks if webhook_url is configured."""
+def _write_claude_settings(repo_path: str, run_id: str, config: dict) -> None:
+    """Write .claude/settings.json with webhook hooks when webhook_url is configured."""
     webhook_url = config.get("webhook_url")
     if not webhook_url:
         return
@@ -224,8 +325,6 @@ def _write_claude_hooks(repo_path: str, run_id: str, config: dict) -> None:
     hooks_dir = os.path.join(repo_path, ".claude")
     os.makedirs(hooks_dir, exist_ok=True)
 
-    # Shell script that POSTs hook events to the webhook.
-    # Auth token is passed via env var (POKE_WEBHOOK_TOKEN) to avoid leaking to the filesystem.
     hook_script = os.path.join(hooks_dir, "poke-hook.sh")
     with open(hook_script, "w") as f:
         f.write(f"""#!/bin/sh
@@ -242,6 +341,16 @@ curl -sf -X POST '{webhook_url}' -H 'Content-Type: application/json' $AUTH_HEADE
 """)
     os.chmod(hook_script, 0o755)
 
+    hook_tools = {
+        "Read": "read", "Glob": "glob", "Grep": "grep", "Bash": "bash",
+        "WebSearch": "web_search", "Task": "subagent",
+        "EditTool": "edit", "WriteTool": "write", "Stop": "stop",
+    }
+    poke_hooks = {
+        tool: [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} {event}"}]}]
+        for tool, event in hook_tools.items()
+    }
+
     # Merge with existing settings if present
     settings_path = os.path.join(hooks_dir, "settings.json")
     existing: dict = {}
@@ -252,14 +361,49 @@ curl -sf -X POST '{webhook_url}' -H 'Content-Type: application/json' $AUTH_HEADE
         except (json.JSONDecodeError, OSError):
             pass
 
-    poke_hooks = {
-        "EditTool": [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} edit"}]}],
-        "WriteTool": [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} write"}]}],
-        "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": f"{hook_script} stop"}]}],
-    }
     existing.setdefault("hooks", {}).update(poke_hooks)
-
     with open(settings_path, "w") as f:
+        json.dump(existing, f)
+
+
+def _build_context7_mcp_config(config: dict) -> str | None:
+    """Return a JSON string for --mcp-config if Context7 API key is available."""
+    key = config.get("context7_api_key") or os.environ.get("CONTEXT7_API_KEY", "")
+    if not key:
+        return None
+    return json.dumps({
+        "mcpServers": {
+            "context7": {
+                "type": "url",
+                "url": "https://mcp.context7.com/mcp",
+                "headers": {"CONTEXT7_API_KEY": key},
+            }
+        }
+    })
+
+
+def _write_opencode_config(repo_path: str, config: dict) -> None:
+    """Write opencode.json with MCP config in workspace root, merging with existing."""
+    key = config.get("context7_api_key") or os.environ.get("CONTEXT7_API_KEY", "")
+    if not key:
+        return
+
+    oc_path = os.path.join(repo_path, "opencode.json")
+    existing: dict = {}
+    if os.path.isfile(oc_path):
+        try:
+            with open(oc_path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    existing.setdefault("mcp", {})["context7"] = {
+        "type": "remote",
+        "url": "https://mcp.context7.com/mcp",
+        "headers": {"CONTEXT7_API_KEY": key},
+        "enabled": True,
+    }
+    with open(oc_path, "w") as f:
         json.dump(existing, f)
 
 
@@ -386,6 +530,10 @@ async def run_claude_task(
     if system_prompt:
         cmd.extend(["--append-system-prompt", system_prompt])
 
+    mcp_config_json = _build_context7_mcp_config(config)
+    if mcp_config_json:
+        cmd.extend(["--mcp-config", mcp_config_json])
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -418,6 +566,21 @@ async def run_claude_task(
                 continue
 
             _handle_claude_event(run, event)
+
+            # Fire per-event webhook for tool use (fire-and-forget)
+            event_type = event.get("type", "")
+            if event_type == "assistant":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use":
+                        tool_input = block.get("input", {})
+                        file_path = None
+                        if isinstance(tool_input, dict):
+                            file_path = tool_input.get("file_path") or tool_input.get("file") or tool_input.get("path")
+                        asyncio.create_task(_fire_event_webhook(
+                            run, "tool_use",
+                            {"tool_name": block.get("name"), "file_path": file_path},
+                            config, http_client,
+                        ))
 
             if (
                 progress_interval
@@ -606,6 +769,23 @@ async def run_opencode_task(
 
             _handle_opencode_event(run, event)
 
+            # Fire per-event webhooks for tool use and step events (fire-and-forget)
+            event_type = event.get("type", "")
+            if event_type == "tool_use":
+                tool_input = event.get("input", {})
+                file_path = None
+                if isinstance(tool_input, dict):
+                    file_path = tool_input.get("file_path") or tool_input.get("file") or tool_input.get("path")
+                asyncio.create_task(_fire_event_webhook(
+                    run, "tool_use",
+                    {"tool_name": event.get("tool", event.get("name")), "file_path": file_path},
+                    config, http_client,
+                ))
+            elif event_type in ("step_start", "step_finish"):
+                asyncio.create_task(_fire_event_webhook(
+                    run, event_type, {}, config, http_client,
+                ))
+
             # Fire progress webhook every N turns (only once per threshold)
             if (
                 progress_interval
@@ -715,6 +895,37 @@ async def _fire_webhook(
         logger.exception("Webhook failed for run %s", run.run_id)
 
 
+async def _fire_event_webhook(
+    run: RunState,
+    event_name: str,
+    details: dict,
+    config: dict,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Send a lightweight per-event webhook (tool use, step start/finish)."""
+    webhook_url = config.get("webhook_url")
+    if not webhook_url:
+        return
+
+    payload = {
+        "run_id": run.run_id,
+        "type": "hook",
+        "event": event_name,
+        "tool_name": details.get("tool_name"),
+        "file_path": details.get("file_path"),
+        "ts": _now(),
+    }
+
+    headers = _build_webhook_headers(config)
+    try:
+        await http_client.post(webhook_url, json=payload, headers={
+            "Content-Type": "application/json",
+            **headers,
+        }, timeout=5)
+    except Exception:
+        pass  # best-effort, don't block the event loop
+
+
 async def _fire_progress_webhook(
     run: RunState,
     config: dict,
@@ -764,6 +975,7 @@ async def lifespan(server: FastMCP):
     clone_semaphore = asyncio.Semaphore(max_concurrent_clones)
 
     runs: dict[str, RunState] = {}
+    auth_flows: dict[str, dict] = {}  # pending OAuth flows keyed by flow_id
 
     async with httpx.AsyncClient() as http_client:
         logger.info("poke-code started")
@@ -773,6 +985,7 @@ async def lifespan(server: FastMCP):
                 "runs": runs,
                 "http_client": http_client,
                 "clone_semaphore": clone_semaphore,
+                "auth_flows": auth_flows,
             }
         finally:
             for run in runs.values():
@@ -917,9 +1130,16 @@ async def execute_task(
         with open(claude_md_path, "w") as f:
             f.write(claude_md)
 
-    # Write Claude Code hooks for webhook progress (optional, claude engine only)
+    # Append Context7 prompt when API key is available
+    context7_key = config.get("context7_api_key") or os.environ.get("CONTEXT7_API_KEY", "")
+    if context7_key:
+        system_prompt = (system_prompt + "\n\n" + _CONTEXT7_PROMPT) if system_prompt else _CONTEXT7_PROMPT
+
+    # Write engine-specific settings (hooks, MCP config)
     if resolved_engine == "claude":
-        _write_claude_hooks(run.repo_path, run_id, config)
+        _write_claude_settings(run.repo_path, run_id, config)
+    elif resolved_engine == "opencode":
+        _write_opencode_config(run.repo_path, config)
 
     # Preserve plan_text for implement mode before reset
     saved_plan = run.plan_text if mode == "implement" else None
@@ -1233,11 +1453,446 @@ async def setup_auth(ctx: Context, engine: str = "claude") -> dict:
         }
 
     elif engine == "opencode":
-        if shutil.which("opencode"):
-            return {"authenticated": True, "engine": "opencode", "method": "cli"}
-        return {"authenticated": False, "engine": "opencode", "instructions": "opencode CLI is not installed."}
+        if not shutil.which("opencode"):
+            return {"authenticated": False, "engine": "opencode", "instructions": "opencode CLI is not installed."}
+
+        auth_data = _read_auth_json()
+        authenticated = []
+        not_authenticated = []
+
+        for provider, info in _OPENCODE_PROVIDERS.items():
+            auth_key = info.get("auth_key", provider)
+            ptype = info["type"]
+
+            # Check auth.json
+            cred = auth_data.get(auth_key)
+            if cred:
+                cred_type = cred.get("type", "unknown")
+                expires = cred.get("expires", 0)
+                status = "active"
+                if expires and expires < time.time() * 1000:  # auth.json uses ms
+                    status = "expired"
+                authenticated.append({"provider": provider, "method": cred_type, "status": status})
+                continue
+
+            # Check env vars
+            env_keys = info.get("env")
+            if env_keys:
+                keys = [env_keys] if isinstance(env_keys, str) else env_keys
+                if all(os.environ.get(k) for k in keys):
+                    authenticated.append({"provider": provider, "method": "env", "status": "active"})
+                    continue
+
+            # Not authenticated — list available auth methods
+            auth_methods = []
+            if ptype == "api":
+                auth_methods.append("api_key")
+            elif ptype == "oauth_device":
+                auth_methods.extend(["oauth_device", "api_key"])
+            elif ptype == "oauth_redirect":
+                auth_methods.extend(["oauth_redirect", "api_key"])
+            elif ptype == "env_only":
+                auth_methods.append("env_vars")
+            not_authenticated.append({"provider": provider, "auth_methods": auth_methods})
+
+        return {
+            "engine": "opencode",
+            "binary_found": True,
+            "authenticated": authenticated,
+            "not_authenticated": not_authenticated,
+        }
 
     return {"error": f"Unknown engine '{engine}'"}
+
+
+def _expire_auth_flows(auth_flows: dict[str, dict]) -> None:
+    """Remove expired auth flows from the in-memory store."""
+    now = time.time()
+    expired = [fid for fid, f in auth_flows.items() if f.get("expires_at", 0) < now]
+    for fid in expired:
+        del auth_flows[fid]
+
+
+@mcp.tool(description=(
+    "Authenticate an OpenCode provider. "
+    "For API key providers: pass provider + api_key. "
+    "For OAuth providers (openai, anthropic, google): pass provider only to start the flow. "
+    "Returns a flow_id + instructions — poll with provider_login_poll."
+))
+async def provider_login(
+    ctx: Context,
+    provider: str,
+    api_key: str = "",
+    plan: str = "console",
+) -> dict:
+    auth_flows: dict[str, dict] = ctx.request_context.lifespan_context["auth_flows"]
+    http_client: httpx.AsyncClient = ctx.request_context.lifespan_context["http_client"]
+
+    _expire_auth_flows(auth_flows)
+
+    if provider not in _OPENCODE_PROVIDERS:
+        return {"error": f"Unknown provider '{provider}'. Known: {', '.join(_OPENCODE_PROVIDERS)}"}
+
+    info = _OPENCODE_PROVIDERS[provider]
+    ptype = info["type"]
+    auth_key = info.get("auth_key", provider)
+
+    # --- API key flow ---
+    if api_key and api_key.strip():
+        if ptype == "env_only":
+            return {"error": f"Provider '{provider}' only supports env var auth, not API keys."}
+        _write_auth_json({auth_key: {"type": "api", "key": api_key.strip()}})
+        return {"status": "authenticated", "provider": provider, "method": "api_key"}
+
+    # --- Env-only providers ---
+    if ptype == "env_only":
+        env_keys = info["env"]
+        keys = [env_keys] if isinstance(env_keys, str) else env_keys
+        missing = [k for k in keys if not os.environ.get(k)]
+        if missing:
+            return {"error": f"Set these env vars on the server: {', '.join(missing)}", "provider": provider}
+        return {"status": "authenticated", "provider": provider, "method": "env"}
+
+    # --- API-key-only providers need a key ---
+    if ptype == "api":
+        return {"error": f"Provider '{provider}' requires an api_key parameter.", "provider": provider}
+
+    # --- OpenAI device code flow ---
+    if provider == "openai":
+        try:
+            resp = await http_client.post(
+                _OPENAI_DEVICE_AUTH_URL,
+                data={
+                    "client_id": _OPENAI_CLIENT_ID,
+                    "scope": "openid profile email offline_access",
+                    "audience": "https://api.openai.com/v1",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return {"error": f"OpenAI device auth failed: {resp.status_code} {resp.text}"}
+            body = resp.json()
+        except Exception as e:
+            return {"error": f"Failed to contact OpenAI auth: {e}"}
+
+        flow_id = str(uuid.uuid4())
+        auth_flows[flow_id] = {
+            "provider": "openai",
+            "type": "device_code",
+            "device_code": body.get("device_code"),
+            "interval": body.get("interval", 5),
+            "expires_at": time.time() + body.get("expires_in", _DEVICE_FLOW_TTL),
+        }
+        return {
+            "status": "awaiting_auth",
+            "flow_id": flow_id,
+            "url": body.get("verification_uri_complete") or body.get("verification_uri", "https://auth.openai.com/activate"),
+            "code": body.get("user_code", ""),
+            "expires_in": body.get("expires_in", _DEVICE_FLOW_TTL),
+            "instructions": "Open the URL and enter the code to authenticate.",
+        }
+
+    # --- GitHub Copilot device code flow ---
+    if provider == "github-copilot":
+        try:
+            resp = await http_client.post(
+                "https://github.com/login/device/code",
+                data={"client_id": "Iv1.b507a08c87ecfe98", "scope": "read:user"},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return {"error": f"GitHub device auth failed: {resp.status_code} {resp.text}"}
+            body = resp.json()
+        except Exception as e:
+            return {"error": f"Failed to contact GitHub auth: {e}"}
+
+        flow_id = str(uuid.uuid4())
+        auth_flows[flow_id] = {
+            "provider": "github-copilot",
+            "type": "device_code",
+            "device_code": body.get("device_code"),
+            "interval": body.get("interval", 5),
+            "expires_at": time.time() + body.get("expires_in", _DEVICE_FLOW_TTL),
+        }
+        return {
+            "status": "awaiting_auth",
+            "flow_id": flow_id,
+            "url": body.get("verification_uri", "https://github.com/login/device"),
+            "code": body.get("user_code", ""),
+            "expires_in": body.get("expires_in", _DEVICE_FLOW_TTL),
+            "instructions": "Open the URL and enter the code to authenticate with GitHub.",
+        }
+
+    # --- Anthropic redirect flow ---
+    if provider == "anthropic":
+        if plan not in ("max", "console"):
+            return {"error": "plan must be 'max' or 'console'"}
+
+        verifier, challenge = _generate_pkce()
+        state = str(uuid.uuid4())
+        flow_id = str(uuid.uuid4())
+        redirect_uri = "http://localhost:0/callback"  # placeholder — user provides via callback tool
+
+        auth_url = _ANTHROPIC_AUTHORIZE_URLS[plan]
+        params = (
+            f"?response_type=code"
+            f"&client_id={_ANTHROPIC_CLIENT_ID}"
+            f"&redirect_uri={redirect_uri}"
+            f"&scope=org:read user:read"
+            f"&state={state}"
+            f"&code_challenge={challenge}"
+            f"&code_challenge_method=S256"
+        )
+
+        auth_flows[flow_id] = {
+            "provider": "anthropic",
+            "type": "redirect",
+            "verifier": verifier,
+            "state": state,
+            "redirect_uri": redirect_uri,
+            "token_url": _ANTHROPIC_TOKEN_URL,
+            "plan": plan,
+            "expires_at": time.time() + _REDIRECT_FLOW_TTL,
+            "completed": False,
+        }
+        return {
+            "status": "awaiting_auth",
+            "flow_id": flow_id,
+            "url": auth_url + params,
+            "expires_in": _REDIRECT_FLOW_TTL,
+            "instructions": "Open this URL in a browser to authenticate. Then use provider_login_callback with the redirect URL.",
+        }
+
+    # --- Google redirect flow ---
+    if provider == "google":
+        verifier, challenge = _generate_pkce()
+        state = str(uuid.uuid4())
+        flow_id = str(uuid.uuid4())
+        redirect_uri = "http://localhost:8085/oauth2callback"
+
+        params = (
+            f"?response_type=code"
+            f"&client_id={_GOOGLE_CLIENT_ID}"
+            f"&redirect_uri={redirect_uri}"
+            f"&scope=https://www.googleapis.com/auth/generative-language.retriever"
+            f"&state={state}"
+            f"&code_challenge={challenge}"
+            f"&code_challenge_method=S256"
+            f"&access_type=offline"
+            f"&prompt=consent"
+        )
+
+        auth_flows[flow_id] = {
+            "provider": "google",
+            "type": "redirect",
+            "verifier": verifier,
+            "state": state,
+            "redirect_uri": redirect_uri,
+            "token_url": _GOOGLE_TOKEN_URL,
+            "expires_at": time.time() + _REDIRECT_FLOW_TTL,
+            "completed": False,
+        }
+        return {
+            "status": "awaiting_auth",
+            "flow_id": flow_id,
+            "url": _GOOGLE_AUTH_URL + params,
+            "expires_in": _REDIRECT_FLOW_TTL,
+            "instructions": "Open this URL in a browser to authenticate. Then use provider_login_callback with the redirect URL.",
+        }
+
+    return {"error": f"Provider '{provider}' does not support interactive login."}
+
+
+@mcp.tool(description="Poll an in-progress OAuth device code flow. Call after provider_login returned status='awaiting_auth'.")
+async def provider_login_poll(ctx: Context, flow_id: str) -> dict:
+    auth_flows: dict[str, dict] = ctx.request_context.lifespan_context["auth_flows"]
+    http_client: httpx.AsyncClient = ctx.request_context.lifespan_context["http_client"]
+
+    _expire_auth_flows(auth_flows)
+
+    flow = auth_flows.get(flow_id)
+    if not flow:
+        return {"error": f"Flow {flow_id} not found or expired."}
+
+    if flow.get("expires_at", 0) < time.time():
+        del auth_flows[flow_id]
+        return {"status": "expired", "flow_id": flow_id}
+
+    # --- Redirect flows: check if completed by callback ---
+    if flow["type"] == "redirect":
+        if flow.get("completed"):
+            del auth_flows[flow_id]
+            return {"status": "authenticated", "provider": flow["provider"]}
+        return {"status": "pending", "flow_id": flow_id, "instructions": "Use provider_login_callback to provide the redirect URL."}
+
+    # --- Device code flows: poll token endpoint ---
+    provider = flow["provider"]
+
+    if provider == "openai":
+        try:
+            resp = await http_client.post(
+                _OPENAI_TOKEN_URL,
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": _OPENAI_CLIENT_ID,
+                    "device_code": flow["device_code"],
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10,
+            )
+            body = resp.json()
+        except Exception as e:
+            return {"error": f"Failed to poll OpenAI: {e}"}
+
+        if resp.status_code == 200 and body.get("access_token"):
+            _write_auth_json({
+                "openai": {
+                    "type": "oauth",
+                    "access": body["access_token"],
+                    "refresh": body.get("refresh_token", ""),
+                    "expires": int(time.time() * 1000) + body.get("expires_in", 3600) * 1000,
+                }
+            })
+            del auth_flows[flow_id]
+            return {"status": "authenticated", "provider": "openai"}
+
+        error = body.get("error", "")
+        if error == "authorization_pending":
+            return {"status": "pending", "flow_id": flow_id, "retry_after": flow.get("interval", 5)}
+        if error == "slow_down":
+            flow["interval"] = flow.get("interval", 5) + 5
+            return {"status": "pending", "flow_id": flow_id, "retry_after": flow["interval"], "detail": "slow_down"}
+        if error == "expired_token":
+            del auth_flows[flow_id]
+            return {"status": "expired", "flow_id": flow_id}
+        return {"status": "error", "detail": body.get("error_description", error)}
+
+    if provider == "github-copilot":
+        try:
+            resp = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                data={
+                    "client_id": "Iv1.b507a08c87ecfe98",
+                    "device_code": flow["device_code"],
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            body = resp.json()
+        except Exception as e:
+            return {"error": f"Failed to poll GitHub: {e}"}
+
+        if body.get("access_token"):
+            _write_auth_json({
+                "github-copilot": {
+                    "type": "oauth",
+                    "access": body["access_token"],
+                    "refresh": body.get("refresh_token", body["access_token"]),
+                    "expires": 0,
+                }
+            })
+            del auth_flows[flow_id]
+            return {"status": "authenticated", "provider": "github-copilot"}
+
+        error = body.get("error", "")
+        if error == "authorization_pending":
+            return {"status": "pending", "flow_id": flow_id, "retry_after": flow.get("interval", 5)}
+        if error == "slow_down":
+            flow["interval"] = flow.get("interval", 5) + 5
+            return {"status": "pending", "flow_id": flow_id, "retry_after": flow["interval"], "detail": "slow_down"}
+        if error == "expired_token":
+            del auth_flows[flow_id]
+            return {"status": "expired", "flow_id": flow_id}
+        return {"status": "error", "detail": body.get("error_description", error)}
+
+    return {"error": f"Cannot poll flow for provider '{provider}'."}
+
+
+@mcp.tool(description="Complete an OAuth redirect flow by providing the callback URL. Use when the browser can't reach the server's localhost.")
+async def provider_login_callback(ctx: Context, flow_id: str, callback_url: str) -> dict:
+    auth_flows: dict[str, dict] = ctx.request_context.lifespan_context["auth_flows"]
+    http_client: httpx.AsyncClient = ctx.request_context.lifespan_context["http_client"]
+
+    flow = auth_flows.get(flow_id)
+    if not flow:
+        return {"error": f"Flow {flow_id} not found or expired."}
+    if flow["type"] != "redirect":
+        return {"error": "This flow is not a redirect flow. Use provider_login_poll instead."}
+    if flow.get("expires_at", 0) < time.time():
+        del auth_flows[flow_id]
+        return {"status": "expired", "flow_id": flow_id}
+
+    # Parse code and state from callback URL
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(callback_url)
+    params = parse_qs(parsed.query)
+    code = params.get("code", [None])[0]
+    state = params.get("state", [None])[0]
+
+    if not code:
+        return {"error": "No 'code' parameter found in callback URL."}
+    if state != flow["state"]:
+        return {"error": "State mismatch — possible CSRF. Start a new flow."}
+
+    provider = flow["provider"]
+    verifier = flow["verifier"]
+    token_url = flow["token_url"]
+    redirect_uri = flow["redirect_uri"]
+
+    # Exchange code for tokens
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }
+
+    if provider == "anthropic":
+        token_data["client_id"] = _ANTHROPIC_CLIENT_ID
+    elif provider == "google":
+        token_data["client_id"] = _GOOGLE_CLIENT_ID
+        token_data["client_secret"] = _GOOGLE_CLIENT_SECRET
+
+    try:
+        resp = await http_client.post(
+            token_url,
+            data=token_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return {"error": f"Token exchange failed: {resp.status_code} {resp.text}"}
+        body = resp.json()
+    except Exception as e:
+        return {"error": f"Token exchange failed: {e}"}
+
+    auth_key = _OPENCODE_PROVIDERS[provider].get("auth_key", provider)
+    _write_auth_json({
+        auth_key: {
+            "type": "oauth",
+            "access": body.get("access_token", ""),
+            "refresh": body.get("refresh_token", ""),
+            "expires": int(time.time() * 1000) + body.get("expires_in", 3600) * 1000,
+        }
+    })
+
+    del auth_flows[flow_id]
+    return {"status": "authenticated", "provider": provider}
+
+
+@mcp.tool(description="Remove credentials for an OpenCode provider from auth.json.")
+async def provider_logout(ctx: Context, provider: str) -> dict:
+    if provider not in _OPENCODE_PROVIDERS:
+        return {"error": f"Unknown provider '{provider}'. Known: {', '.join(_OPENCODE_PROVIDERS)}"}
+
+    auth_key = _OPENCODE_PROVIDERS[provider].get("auth_key", provider)
+    removed = _remove_auth_json_key(auth_key)
+    if removed:
+        return {"status": "logged_out", "provider": provider}
+    return {"status": "not_found", "provider": provider, "detail": "Provider was not in auth.json."}
 
 
 @mcp.tool(description="Get server info including active run count and system stats.")
