@@ -128,6 +128,7 @@ _CONTEXT7_PROMPT = (
 _OPENCODE_AUTH_FILE = os.path.expanduser("~/.local/share/opencode/auth.json")
 
 _OPENCODE_PROVIDERS = {
+    "opencode": {"env": "OPENCODE_API_KEY", "auth_key": "opencode", "type": "api"},
     "openai": {"env": "OPENAI_API_KEY", "auth_key": "openai", "type": "oauth_device"},
     "anthropic": {"env": "ANTHROPIC_API_KEY", "auth_key": "anthropic", "type": "oauth_redirect"},
     "google": {"env": "GEMINI_API_KEY", "auth_key": "google", "type": "oauth_redirect"},
@@ -366,27 +367,27 @@ curl -sf -X POST '{webhook_url}' -H 'Content-Type: application/json' $AUTH_HEADE
         json.dump(existing, f)
 
 
-def _build_context7_mcp_config(config: dict) -> str | None:
-    """Return a JSON string for --mcp-config if Context7 API key is available."""
+def _build_mcp_config(config: dict) -> str | None:
+    """Return a JSON string for --mcp-config with MCP servers."""
+    servers: dict = {
+        "medusa": {
+            "type": "url",
+            "url": "https://docs.medusajs.com/mcp",
+        },
+    }
     key = config.get("context7_api_key") or os.environ.get("CONTEXT7_API_KEY", "")
-    if not key:
-        return None
-    return json.dumps({
-        "mcpServers": {
-            "context7": {
-                "type": "url",
-                "url": "https://mcp.context7.com/mcp",
-                "headers": {"CONTEXT7_API_KEY": key},
-            }
+    if key:
+        servers["context7"] = {
+            "type": "url",
+            "url": "https://mcp.context7.com/mcp",
+            "headers": {"CONTEXT7_API_KEY": key},
         }
-    })
+    return json.dumps({"mcpServers": servers})
 
 
 def _write_opencode_config(repo_path: str, config: dict) -> None:
     """Write opencode.json with MCP config in workspace root, merging with existing."""
     key = config.get("context7_api_key") or os.environ.get("CONTEXT7_API_KEY", "")
-    if not key:
-        return
 
     oc_path = os.path.join(repo_path, "opencode.json")
     existing: dict = {}
@@ -397,10 +398,17 @@ def _write_opencode_config(repo_path: str, config: dict) -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    existing.setdefault("mcp", {})["context7"] = {
+    mcp = existing.setdefault("mcp", {})
+    if key:
+        mcp["context7"] = {
+            "type": "remote",
+            "url": "https://mcp.context7.com/mcp",
+            "headers": {"CONTEXT7_API_KEY": key},
+            "enabled": True,
+        }
+    mcp["medusa"] = {
         "type": "remote",
-        "url": "https://mcp.context7.com/mcp",
-        "headers": {"CONTEXT7_API_KEY": key},
+        "url": "https://docs.medusajs.com/mcp",
         "enabled": True,
     }
     with open(oc_path, "w") as f:
@@ -530,9 +538,8 @@ async def run_claude_task(
     if system_prompt:
         cmd.extend(["--append-system-prompt", system_prompt])
 
-    mcp_config_json = _build_context7_mcp_config(config)
-    if mcp_config_json:
-        cmd.extend(["--mcp-config", mcp_config_json])
+    mcp_config_json = _build_mcp_config(config)
+    cmd.extend(["--mcp-config", mcp_config_json])
 
     try:
         proc = await asyncio.create_subprocess_exec(
