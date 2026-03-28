@@ -1,27 +1,18 @@
-FROM python:3.13-slim
+ARG BASE_IMAGE=ghcr.io/kacperkwapisz/poke-code-base:latest
+FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=3000 \
     HOME=/home/appuser
 
-# System deps: git, node, ssh (for git push)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates openssh-client && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
-
-# Claude Code CLI — cached unless base image changes
-RUN npm install -g @anthropic-ai/claude-code && \
-    npm cache clean --force
+WORKDIR /app
 
 # Python deps — cached unless requirements.txt changes
-WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code — changes most often, last layer
+# App code
 COPY src/ src/
 COPY config.example.yml config.example.yml
 
