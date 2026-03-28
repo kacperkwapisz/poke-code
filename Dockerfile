@@ -1,14 +1,20 @@
-ARG BASE_IMAGE=ghcr.io/kacperkwapisz/poke-code-base:latest
-FROM ${BASE_IMAGE}
+FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=3000 \
     HOME=/home/appuser
 
-WORKDIR /app
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates openssh-client && \
+    rm -rf /var/lib/apt/lists/*
+
+# Claude Code CLI (native binary)
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Python deps — cached unless requirements.txt changes
+WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
