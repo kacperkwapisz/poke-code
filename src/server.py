@@ -27,6 +27,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 
 # ---------------------------------------------------------------------------
+# Subprocess stream buffer limit (default 64 KB is too small for large JSON
+# event lines that may embed full file contents).
+# ---------------------------------------------------------------------------
+
+_SUBPROCESS_STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
+
+# ---------------------------------------------------------------------------
 # Structured JSON logging
 # ---------------------------------------------------------------------------
 
@@ -572,6 +579,7 @@ async def run_claude_task(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_subprocess_env(config),
+            limit=_SUBPROCESS_STREAM_LIMIT,
         )
         run._process = proc
 
@@ -780,6 +788,7 @@ async def run_opencode_task(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_subprocess_env(config),
+            limit=_SUBPROCESS_STREAM_LIMIT,
         )
         run._process = proc
 
